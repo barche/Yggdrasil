@@ -34,7 +34,7 @@ jobs:
       EXCLUDE_PROJECTS=" LLVM "
 
       # This is the dynamic mapping we're going to build up, if it's empty we don't do anything
-      PROJECTS_MAPPING=""
+      PROJECTS_ACCEPTED=""
       for PROJECT in ${PROJECTS}; do
           NAME=$(basename "${PROJECT}")
           echo "Considering ${PROJECT}"
@@ -58,12 +58,62 @@ jobs:
 
           # Otherwise, emit a build with `PROJECT` set to `${PROJECT}`
           echo " --> Accepted!"
-          PROJECTS_MAPPING="${PROJECTS_MAPPING} '${NAME}':{'PROJECT':'${PROJECT}'}, "
+          PROJECTS_ACCEPTED="${PROJECTS_ACCEPTED} ${PROJECT}"
       done
-      if [[ -n "${PROJECTS_MAPPING}" ]]; then
+      if [[ -n "${PROJECTS_ACCEPTED}" ]]; then
+          # Pull down the latest source BB image, since we're gonna do some building
+          docker pull $(BINARYBUILDER_IMAGE_NAME)
+
+          # Create a docker image that sucks in the current Yggdrasil tree
+          echo "FROM $(BINARYBUILDER_IMAGE_NAME)" > builder.Dockerfile
+          echo "ADD . /workspace" >> builder.Dockerfile
+
+          # Ignore 0_RootFS and .git to make things nice and fast:
+          echo "0_RootFS/*" >> .dockerignore
+          echo ".git/*" >> .dockerignore
+
+          # Build it, tag it with a unique tag name
+          docker build --rm -t bb_worker:$(Build.SourceVersion) -f builder.Dockerfile .
+          
+          # Next, for each project, download its sources
+          for PROJECT in ${PROJECTS_ACCEPTED}; do
+              NAME=$(basename ${PROJECT})
+              DOCKER_OPTS="-t -v /data/staticfloat/yggstorage:/storage -w /workspace/${PROJECT} -e TERM=xterm-16color bb_worker:$(Build.SourceVersion)"
+
+              # First, we get build metadata in the form of a JSON object:
+              CONTAINER_NAME=meta_json-${NAME}-$(Build.SourceVersion)
+              docker run --name=${CONTAINER_NAME} ${DOCKER_OPTS} bash -c " \
+                  echo \"Generating meta.json...\"; \
+                  julia --color=yes ./build_tarballs.jl --meta-json=./meta.json; \
+                  echo \"Downloading sources...\"; \
+                  julia --color=yes /workspace/.ci/download_sources.jl ./meta.json ./platforms.list; \
+              "
+              docker cp ${CONTAINER_NAME}:/workspace/${PROJECT}/platforms.list ${NAME}.platforms.list
+              docker rm ${CONTAINER_NAME}
+          done
+
           echo -n "##vso[task.setVariable variable=legs;isOutput=true]{"
-          echo -n "${PROJECTS_MAPPING}"
-          echo "}"
+          for PROJECT in ${PROJECTS_ACCEPTED}; do
+              NAME=$(basename ${PROJECT})
+
+              # Load in the platforms
+              PLATFORMS=$(cat ${NAME}.platforms.list)
+              if [[ -n "${PLATFORMS}" ]]; then
+                  for PLATFORM in ${PLATFORMS}; do
+                      echo -n "'${NAME}-${PLATFORM}':{'NAME': '${NAME}', 'PROJECT':'${PROJECT}', 'PLATFORM':'${PLATFORM}'}, "
+                  done
+                  echo "}"
+                  for PLATFORM in ${PLATFORMS}; do
+                      echo "'${NAME}-${PLATFORM}':{'NAME': '${NAME}', 'PROJECT':'${PROJECT}', 'PLATFORM':'${PLATFORM}'}, "
+                  done
+              else
+                  # If we were unable to determine the proper platforms, then create a single output with empty platform
+                  echo -n "##vso[task.setVariable variable=legs;isOutput=true]{"
+                  echo -n "'${NAME}-${PLATFORM}':{'NAME': '${NAME}', 'PROJECT':'${PROJECT}', 'PLATFORM':''}, "
+                  echo "}"
+              fi
+              rm -f ${NAME}.platforms.list
+          done
       fi
     name: mtrx
 
@@ -77,22 +127,7 @@ jobs:
   variables:
     mtrx_legs: $[ dependencies.generator.outputs['mtrx.legs'] ]
   steps:
-  # we map /storage (which is a persistent volume mapped within the overall `docker-compose.yml`) to /storage
   - script: |
-      # Pull down the latest source BB image
-      docker pull $(BINARYBUILDER_IMAGE_NAME)
-
-      # Create a docker image that sucks in the current Yggdrasil tree
-      echo "FROM $(BINARYBUILDER_IMAGE_NAME)" > builder.Dockerfile
-      echo "ADD . /workspace" >> builder.Dockerfile
-
-      # Ignore 0_RootFS and .git to make things nice and fast:
-      echo "0_RootFS/*" >> .dockerignore
-      echo ".git/*" >> .dockerignore
-
-      # Build it, tag it with a unique tag name
-      docker build --rm -t bb_worker:$(System.JobId) -f builder.Dockerfile .
-
       # If we're on master and this is not a pull request, then DEPLOY.  NOTE: A
       # manual rebuild of a PR in Azure web interface is not a `PullRequest` for
       # Azure.
@@ -101,12 +136,18 @@ jobs:
           DEPLOY="--deploy --register"
       fi
 
-      # Run inside of that just-built Yggdrasil image
-      docker run -t --rm --privileged -e "GITHUB_TOKEN=$(GITHUB_TOKEN)" -v "/data/staticfloat/yggstorage:/storage" -w "/workspace/$(PROJECT)" -e "TERM=xterm-16color" bb_worker:$(System.JobId) julia --color=yes ./build_tarballs.jl --verbose ${DEPLOY}
+      # Run inside of that just-built Yggdrasil image, mapping /storage in
+      docker run -t --rm --privileged -e "GITHUB_TOKEN=$(GITHUB_TOKEN)" -v "/data/staticfloat/yggstorage:/storage" -w "/workspace/$(PROJECT)" -e "TERM=xterm-16color" bb_worker:$(Build.SourceVersion) julia --color=yes ./build_tarballs.jl --verbose ${DEPLOY} $(PLATFORM)
     displayName: "Build the tarballs"
     condition: ne(variables['mtrx_legs'], '')
+
+- job: cleanup
+  dependsOn: build
+  variables:
+    mtrx_legs: $[ dependencies.generator.outputs['mtrx.legs'] ]
+  steps:
   - script: |
-      docker rmi bb_worker:$(System.JobId)
+      docker rmi bb_worker:$(Build.SourceVersion)
     displayName: "Cleanup docker image"
     # This is so janky, but `always()` eliminates the implicit "previous run succeeded" condition, and
     # the `ne()` allows us to disable this if no PROJECT values were run at all
